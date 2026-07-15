@@ -1,0 +1,104 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wattai
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d wattai"]
+      interval: 10s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redisdata:/data
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports:
+      - "8883:8883"
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./infra/mosquitto/passwd:/mosquitto/config/passwd:ro
+      - ./infra/mosquitto/acl:/mosquitto/config/acl:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - mosquittodata:/mosquitto/data
+      - mosquittologs:/mosquitto/log
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - ./backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  ingestion:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - postgres
+      - mosquitto
+      - redis
+    command: python -m app.services.mqtt.ingestion_worker
+
+  ai_engine:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    command: python -m app.services.ai.engine_worker
+
+  telegram_bot:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    command: python -m app.services.telegram.bot
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    volumes:
+      - frontbuild:/app/dist
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - frontbuild:/usr/share/nginx/html:ro
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  pgdata:
+  redisdata:
+  mosquittodata:
+  mosquittologs:
+  frontbuild:
