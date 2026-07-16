@@ -74,8 +74,8 @@ services:
   frontend:
     build: ./wattai/frontend
     restart: unless-stopped
-    volumes:
-      - 'frontbuild:/app/dist'
+    ports:
+      - '3000:3000'
 
   nginx:
     image: 'nginx:alpine'
@@ -86,7 +86,6 @@ services:
     volumes:
       - './wattai/infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro'
       - '/etc/letsencrypt:/etc/letsencrypt:ro'
-      - 'frontbuild:/usr/share/nginx/html:ro'
     depends_on:
       - backend
       - frontend
@@ -96,4 +95,3 @@ volumes:
   redisdata: null
   mosquittodata: null
   mosquittologs: null
-  frontbuild: null
