@@ -1,0 +1,163 @@
+# Wattwise — Dynamic Tariff Engine
+
+A Laravel-based, database-driven tariff engine for utility billing. Tariffs are defined per country and category (residential / industrial) as **versioned, contiguous tier ladders**, managed from a Filament admin dashboard. All financial math is deterministic and happens in the backend — never inside an LLM.
+
+This module is the pricing core of **Wattwise**, an AI-powered electricity billing optimizer. The AI layer only *narrates* pre-calculated results; this engine is the single source of truth for every number a user sees.
+
+## Design principles (locked)
+
+| # | Principle | What it means in practice |
+|---|-----------|---------------------------|
+| 1 | **Set-level versioning** | A tariff is versioned as a whole ladder. A `TariffVersion` parent owns the effective date range; `Tier` children never carry their own dates. The calculator resolves *one* version per (country, category, date), then iterates its tiers. |
+| 2 | **Half-open intervals `[min, max)`** | Every tier covers `min_kwh` inclusive to `max_kwh` exclusive. Adjacent tiers share a boundary exactly. Consumption landing exactly on a boundary belongs to the **higher** tier — never both, never neither. The top tier is open-ended (`max_kwh = NULL`). |
+| 3 | **DECIMAL everywhere, floats nowhere** | Prices and kWh are stored as `DECIMAL`, cast to strings by Eloquent, and compared/computed via **bcmath**. The final amount is rounded **once**, to the country's minor-unit scale. |
+| 4 | **Timezone-aware effective dates** | `effective_from` / `effective_to` are `timestamptz`. Version resolution happens in the *country's* local timezone, not UTC. |
+| 5 | **Append-only usage logs** | `usage_logs` rows are immutable (enforced at the model level). Corrections are new rows pointing at the row they supersede via `supersedes_id`, with a mandatory `correction_reason`. Daily granularity preserves the option of prorated mid-cycle billing later. |
+
+## Schema
+
+```
+countries
+├── code (unique, ISO 3166-1)        e.g. "SA", "SY"
+├── currency_code (ISO 4217)         e.g. "SAR", "SYP"
+├── currency_minor_unit_scale        final rounding precision
+└── timezone (IANA)                  e.g. "Asia/Riyadh"
+
+tariff_versions                      ← the versioned ladder (parent)
+├── country_id → countries
+├── category                         "residential" | "industrial"
+├── effective_from / effective_to    half-open range, timestamptz, NULL = open-ended
+└── label                            e.g. "SA residential 2026 Q2"
+
+tiers                                ← ladder rows (children, cascade on delete)
+├── tariff_version_id → tariff_versions
+├── sort_order
+├── min_kwh / max_kwh                DECIMAL(12,3); max NULL only on the last tier
+└── price_per_kwh                    DECIMAL(12,6)
+
+usage_logs                           ← daily granularity, append-only
+├── user_id, usage_date, consumption_kwh
+├── supersedes_id → usage_logs      corrections chain, never UPDATE
+└── correction_reason               required when superseding
+```
+
+On **PostgreSQL**, the migrations add defense-in-depth constraints on top of app-level validation:
+
+- a `gist` **exclusion constraint** making overlapping effective ranges for the same (country, category) impossible to insert (`btree_gist` extension, created automatically);
+- check constraints for `price_per_kwh >= 0` and `min_kwh < max_kwh`.
+
+## Ladder validation
+
+`App\Services\TariffLadderValidator` is the authoritative, framework-agnostic validator. A ladder is rejected unless **all** of the following hold:
+
+- strictly ascending by `sort_order` / `min_kwh`
+- the first tier starts at exactly `0`
+- adjacent tiers are contiguous: tier N's `max_kwh` **equals** tier N+1's `min_kwh` (no gaps, no overlaps)
+- exactly **one** open-ended tier, and it is the **last** one
+- `min_kwh < max_kwh` within every bounded tier
+- `price_per_kwh >= 0` everywhere
+
+Errors come back keyed by field (`tiers.{index}.{field}`), so they map cleanly onto Filament Repeater rows.
+
+`App\Rules\ContiguousTariffLadder` is the thin Laravel `ValidationRule` wrapper for form usage:
+
+```php
+use App\Rules\ContiguousTariffLadder;
+
+Forms\Components\Repeater::make('tiers')
+    ->schema([
+        Forms\Components\TextInput::make('min_kwh')->numeric()->required(),
+        Forms\Components\TextInput::make('max_kwh')->numeric()
+            ->helperText('Leave empty on the last tier (open-ended).'),
+        Forms\Components\TextInput::make('price_per_kwh')->numeric()->required(),
+        Forms\Components\Hidden::make('sort_order'),
+    ])
+    ->orderColumn('sort_order')
+    ->rule(new ContiguousTariffLadder());
+```
+
+An invalid ladder cannot be saved — a whole `TariffVersion` (parent + tiers) publishes atomically or not at all.
+
+## Version resolution
+
+The calculator never assembles a ladder from independently-dated rows. It resolves one version, then reads its tiers:
+
+```php
+use App\Models\TariffVersion;
+
+// Convert the billing period's reference date into the COUNTRY's timezone first
+// (locked decision #4), then resolve:
+$version = TariffVersion::query()
+    ->forCountryCategory($country->id, TariffVersion::CATEGORY_RESIDENTIAL)
+    ->effectiveAt($periodEnd->setTimezone($country->timezone))
+    ->with('tiers')          // tiers come back in ladder order
+    ->first();
+
+// No version covering the date? That's a hard NO_ACTIVE_TARIFF error —
+// the calculator must never guess or fall back to a default.
+```
+
+## Example ladders
+
+**Saudi Arabia — residential, monthly:**
+
+| Tier | Range (kWh) | Price |
+|------|-------------|-------|
+| 1 | `[0, 6000)` | 0.18 SAR |
+| 2 | `[6000, ∞)` | 0.30 SAR |
+
+Consumption of exactly **6,000 kWh**: the first 6,000 kWh fill tier 1 (`[0, 6000)` holds 6,000 whole kWh: 0 through 5,999.999), and the boundary value itself marks the start of tier 2. The half-open convention makes this unambiguous — no kWh is ever counted twice.
+
+**Syria — residential, bimonthly:**
+
+| Tier | Range (kWh) | Price |
+|------|-------------|-------|
+| 1 | `[0, 300)` | 600 SYP |
+| 2 | `[300, ∞)` | 1400 SYP |
+
+## Installation
+
+```bash
+# copy migrations, models, rules, and services into your Laravel app, then:
+php artisan migrate
+```
+
+Requirements:
+
+- PHP ≥ 8.2 with **ext-bcmath**
+- Laravel 11+
+- PostgreSQL recommended (exclusion constraints); MySQL works with app-level validation only
+- Filament v3 for the admin resource
+
+## Project layout
+
+```
+app/
+├── Models/
+│   ├── Country.php
+│   ├── TariffVersion.php      # effectiveAt() / forCountryCategory() scopes
+│   ├── Tier.php                # DECIMAL string casts for bcmath
+│   └── UsageLog.php            # append-only, enforced in booted()
+├── Rules/
+│   └── ContiguousTariffLadder.php
+└── Services/
+    └── TariffLadderValidator.php
+database/
+└── migrations/
+    ├── ..._create_countries_table.php
+    ├── ..._create_tariff_versions_table.php
+    ├── ..._create_tiers_table.php
+    └── ..._create_usage_logs_table.php
+```
+
+## Roadmap
+
+- [x] Schema, models, and ladder validation (this module)
+- [ ] `PricingCalculatorService` — the deterministic slicing loop + input-validation gate
+- [ ] PHPUnit suite: boundary inclusivity, zero consumption, multi-tier crossing, float-drift, `NO_ACTIVE_TARIFF`
+- [ ] Filament `TariffVersionResource` with the Repeater wired to the validation rule
+- [ ] Secure API layer (Bearer auth) exposing the calculation contract to the AI gateway
+
+## License
+
+MIT
