@@ -3,7 +3,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 COPY . .
-RUN npm run build
+RUN npx vite build || npm run build
 
 FROM scratch AS export
 COPY --from=builder /app/dist /dist
